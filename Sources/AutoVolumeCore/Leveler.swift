@@ -43,6 +43,11 @@ public final class Leveler {
     private let hpCoef: Float
     private var meanSquare: Float = 0
     private let msCoef: Float
+    // Presence detection: a fast detector tells "someone is speaking" from "a pause".
+    private var fastSquare: Float = 0
+    private let fastCoef: Float
+    private var quietSamples = 0
+    private let holdSamples: Int
 
     // AGC gain (linear-in-dB state, smoothed).
     private var agcGainDb: Float = 0
@@ -76,6 +81,8 @@ public final class Leveler {
 
         hpCoef = exp(-2 * .pi * 80 / sr)   // ~80 Hz one-pole high-pass
         msCoef = coef(0.6)                 // 600 ms RMS window
+        fastCoef = coef(0.04)              // 40 ms presence detector
+        holdSamples = Int(2.5 * sr)        // pauses shorter than this never change the gain
         agcAttackCoef = coef(0.2)          // big loud jump: reduce fast
         agcReleaseCoef = coef(0.75)        // gain increase: moderately slow
         agcSlowCoef = coef(4.0)
@@ -117,12 +124,27 @@ public final class Leveler {
                 let hp = hpCoef * (hpState + mono - hpPrevIn)
                 hpState = hp
                 hpPrevIn = mono
-                meanSquare = msCoef * meanSquare + (1 - msCoef) * (hp * hp)
-                let levelDb = 10 * log10f(max(meanSquare, 1e-12))
+                fastSquare = fastCoef * fastSquare + (1 - fastCoef) * (hp * hp)
+                let fastDb = 10 * log10f(max(fastSquare, 1e-12))
+                let slowDb = 10 * log10f(max(meanSquare, 1e-12))
+
+                // Presence: signal must be above the gate and not far below what we have been tracking.
+                // During a pause (or room tone between phrases) everything is frozen, so the gain
+                // cannot creep up and make the next phrase start too loud. After a long quiet spell
+                // (a genuine scene change) tracking resumes.
+                let present = fastDb > max(cfg.gateDb, slowDb - 15)
+                quietSamples = present ? 0 : min(quietSamples + 1, holdSamples + 1)
+                let tracking = present || quietSamples > holdSamples
+
+                var levelDb = slowDb
+                if tracking {
+                    meanSquare = msCoef * meanSquare + (1 - msCoef) * (hp * hp)
+                    levelDb = 10 * log10f(max(meanSquare, 1e-12))
+                }
                 currentLevelDb = levelDb
 
-                // --- AGC: steer toward target; hold when below the gate.
-                if levelDb > cfg.gateDb {
+                // --- AGC: steer toward target; hold when paused or below the gate.
+                if tracking && levelDb > cfg.gateDb {
                     let desired = min(cfg.maxBoostDb, max(-cfg.maxCutDb, targetDb - levelDb))
                     let err = desired - agcGainDb
                     // Small deviations drift slowly (keeps speech emphasis); a big jump switches to

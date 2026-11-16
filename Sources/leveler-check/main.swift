@@ -31,6 +31,15 @@ if CommandLine.arguments.count > 1 {
     let cur = 10 * log10f(x.reduce(Float(0)) { $0 + $1 * $1 } / Float(x.count))
     let k = powf(10, (inDb - cur) / 20)
     for i in 0..<x.count { x[i] *= k }
+    // Optional background noise floor (dB relative to speech), e.g. -28: room tone / music bed in pauses.
+    if CommandLine.arguments.count > 3, let rel = Float(CommandLine.arguments[3]) {
+        let amp = powf(10, (inDb + rel) / 20) * 1.7
+        var seed: UInt32 = 12345
+        for i in 0..<x.count {
+            seed = seed &* 1664525 &+ 1013904223
+            x[i] += amp * (Float(seed >> 8) / Float(1 << 24) - 0.5)
+        }
+    }
     // Emphasis test: a 2 s phrase (7.0-9.0 s) is 8 dB louder, like a stressed phrase.
     let swellDb: Float = 8
     let swellFrom = Int(7.0 * sr), swellTo = Int(9.0 * sr)
@@ -51,11 +60,13 @@ if CommandLine.arguments.count > 1 {
     let blk = Int(sr * 0.05)
     var gains = [Float]()
     var gIn = [Float](), gOut = [Float]()
+    var bIn = [Float](), bGain = [Float]()
     var b = 0
     while (b + 1) * blk + d < out.count {
         let a = src[(b * blk)..<((b + 1) * blk)]
         let o = out[(b * blk + d)..<((b + 1) * blk + d)]
         let ia = rmsDb(a), oa = rmsDb(o)
+        bIn.append(ia); bGain.append(ia > -50 ? oa - ia : .nan)
         if ia > -50 {
             gains.append(oa - ia)
             let mid = b * blk + blk / 2
@@ -72,6 +83,32 @@ if CommandLine.arguments.count > 1 {
     let sd = sqrtf(gains.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Float(gains.count))
     print(String(format: "in %.0f dB | effective gain: mean %+.1f, sd %.2f dB, p5..p95 %+.1f..%+.1f (spread %.1f dB), max 50ms step %.1f dB",
                  inDb, mean, sd, pct(0.05), pct(0.95), pct(0.95) - pct(0.05), maxStep))
+    // Pause-onset test: after a pause, the first 200 ms of speech must not be louder than later speech.
+    func avgValid(_ x: ArraySlice<Float>) -> Float? {
+        var sum: Float = 0
+        var n = 0
+        for v in x where !v.isNaN { sum += v; n += 1 }
+        return n > 0 ? sum / Float(n) : nil
+    }
+    var overs = [Float]()
+    var pos = 8
+    while pos + 20 < bIn.count {
+        var wasQuiet = bIn[pos] > -45
+        for q in (pos - 8)..<pos where bIn[q] >= -45 { wasQuiet = false }
+        if wasQuiet {
+            if let first = avgValid(bGain[pos..<(pos + 4)]), let later = avgValid(bGain[(pos + 10)..<(pos + 20)]) {
+                overs.append(first - later)
+            }
+            pos += 20
+        } else { pos += 1 }
+    }
+    if !overs.isEmpty {
+        var total: Float = 0
+        var worst: Float = -100
+        for v in overs { total += v; worst = max(worst, v) }
+        print(String(format: "      pause onsets: %d found, speech start is %+.1f dB vs later in the phrase (avg), worst %+.1f dB",
+                     overs.count, total / Float(overs.count), worst))
+    }
     let mIn = gIn.reduce(0, +) / Float(max(gIn.count, 1)), mOut = gOut.reduce(0, +) / Float(max(gOut.count, 1))
     print(String(format: "      emphasis test: +%.0f dB phrase -> output rose %.1f dB (%.0f%% of the emphasis kept)",
                  swellDb, swellDb + (mIn - mOut), 100 * (swellDb + (mIn - mOut)) / swellDb))
