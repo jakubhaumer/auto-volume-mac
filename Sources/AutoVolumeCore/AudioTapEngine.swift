@@ -1,20 +1,19 @@
 import AudioToolbox
 import CoreAudio
 import Foundation
-import AutoVolumeCore
 
-enum EngineError: Error, CustomStringConvertible {
+public enum EngineError: Error, LocalizedError, CustomStringConvertible {
     case coreAudio(String, OSStatus)
     case message(String)
 
-    var description: String {
+    public var description: String {
         switch self {
-        case let .coreAudio(what, status):
-            return "\(what) failed (OSStatus \(status))"
-        case let .message(m):
-            return m
+        case let .coreAudio(what, status): return "\(what) failed (OSStatus \(status))"
+        case let .message(m): return m
         }
     }
+
+    public var errorDescription: String? { description }
 }
 
 private func check(_ status: OSStatus, _ what: String) throws {
@@ -28,9 +27,29 @@ private func address(_ selector: AudioObjectPropertySelector,
 
 /// Captures all system audio with a Core Audio process tap (muting the original),
 /// runs it through the `Leveler`, and plays the result on the default output device.
-final class AudioTapEngine {
-    private let config: LevelerConfig
-    private let verbose: Bool
+public final class AudioTapEngine {
+    /// A snapshot of what the engine heard since the previous `readMetrics()` call.
+    public struct Metrics {
+        /// Loudness of what apps are playing, dBFS RMS (-120 = silence).
+        public var inputDb: Float = -120
+        /// Loudness after leveling, dBFS RMS.
+        public var outputDb: Float = -120
+        /// Effective gain applied (output minus input), dB.
+        public var gainDb: Float = 0
+        /// True once any non-zero audio sample has been received since start.
+        public var heardAudio = false
+        public var callbacks = 0
+        public init() {}
+    }
+
+    public private(set) var isRunning = false
+    public private(set) var outputDeviceName = ""
+    /// Called on the main queue after the default output device changed and the pipeline restarted.
+    public var onOutputDeviceChanged: ((String) -> Void)?
+    /// Called on the main queue if an automatic restart failed.
+    public var onError: ((Error) -> Void)?
+
+    private var config: LevelerConfig
 
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
@@ -40,40 +59,61 @@ final class AudioTapEngine {
     private var leveler: Leveler?
     private var scratchL = [Float]()
     private var scratchR = [Float]()
-    private var outputName = ""
-
-    // Diagnostics (written on the IO thread, read for display only).
-    private var cbCount = 0
-    private var dbgInBuffers = 0
-    private var dbgInChannels = 0
-    private var dbgInFrames = 0
-    private var dbgRawPeak: Float = 0
-    private var dbgInMs: Double = 0, dbgOutMs: Double = 0, dbgN: Double = 0
-    private var dbgOutPeak: Float = 0
 
     private var defaultDeviceListener: AudioObjectPropertyListenerBlock?
-    private var statusTimer: DispatchSourceTimer?
     private var restartWork: DispatchWorkItem?
 
-    init(config: LevelerConfig, verbose: Bool) {
+    // Metering (written on the IO thread, read + reset by readMetrics()).
+    private var cbCount = 0
+    private var heardAudio = false
+    private var accIn = 0.0, accOut = 0.0, accN = 0.0
+
+    public init(config: LevelerConfig = LevelerConfig()) {
         self.config = config
-        self.verbose = verbose
     }
 
-    // MARK: - Lifecycle
+    // MARK: - Public API
 
-    func start() throws {
+    public func start() throws {
+        guard !isRunning else { return }
         try buildPipeline()
         installDefaultDeviceListener()
-        if verbose { startStatusTimer() }
+        isRunning = true
     }
 
-    func stop() {
-        statusTimer?.cancel()
-        statusTimer = nil
+    public func stop() {
+        guard isRunning else { return }
         restartWork?.cancel()
         removeDefaultDeviceListener()
         tearDownPipeline()
+        isRunning = false
+    }
+
+    /// Rebuilds the pipeline (e.g. after the Mac woke from sleep).
+    public func restart() throws {
+        guard isRunning else { return }
+        tearDownPipeline()
+        try buildPipeline()
+    }
+
+    /// Applies new settings immediately, without interrupting audio.
+    public func updateConfig(_ newConfig: LevelerConfig) {
+        config = newConfig
+        leveler?.config = newConfig
+    }
+
+    public func readMetrics() -> Metrics {
+        var m = Metrics()
+        let n = accN
+        if n > 0 {
+            m.inputDb = Float(10 * log10(max(accIn / n, 1e-12)))
+            m.outputDb = Float(10 * log10(max(accOut / n, 1e-12)))
+            m.gainDb = m.inputDb > -75 ? m.outputDb - m.inputDb : 0
+        }
+        accIn = 0; accOut = 0; accN = 0
+        m.heardAudio = heardAudio
+        m.callbacks = cbCount
+        return m
     }
 
     // MARK: - Pipeline
@@ -81,9 +121,12 @@ final class AudioTapEngine {
     private func buildPipeline() throws {
         let outputID = try Self.defaultOutputDevice()
         let outputUID = try Self.deviceUID(outputID)
-        outputName = (try? Self.deviceName(outputID)) ?? outputUID
+        outputDeviceName = (try? Self.deviceName(outputID)) ?? outputUID
+        cbCount = 0
+        heardAudio = false
+        accIn = 0; accOut = 0; accN = 0
 
-        // 1. Global stereo tap that mutes the original audio.
+        // 1. Global stereo tap that mutes the original audio (but never our own output).
         let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: Self.ownProcessObjects())
         desc.name = "auto-volume tap"
         desc.uuid = UUID()
@@ -115,8 +158,7 @@ final class AudioTapEngine {
 
             // 3. Sample rate of the aggregate drives the DSP coefficients.
             let rate = try Self.nominalSampleRate(aggregateID)
-            let lv = Leveler(sampleRate: rate, config: config)
-            leveler = lv
+            leveler = Leveler(sampleRate: rate, config: config)
             scratchL = [Float](repeating: 0, count: 16_384)
             scratchR = [Float](repeating: 0, count: 16_384)
 
@@ -126,9 +168,6 @@ final class AudioTapEngine {
                 self.render(input: inData, output: outData)
             }, "AudioDeviceCreateIOProcIDWithBlock")
             try check(AudioDeviceStart(aggregateID, ioProcID), "AudioDeviceStart")
-
-            print("Leveling system audio -> \(outputName) @ \(Int(rate)) Hz"
-                  + (config.bypass ? " [BYPASS]" : ""))
         } catch {
             tearDownPipeline()
             throw error
@@ -158,20 +197,16 @@ final class AudioTapEngine {
         guard let leveler else { return }
         let inBuffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         let outBuffers = UnsafeMutableAudioBufferListPointer(output)
+        cbCount &+= 1
 
-        cbCount += 1
-        dbgInBuffers = inBuffers.count
-        dbgInChannels = inBuffers.reduce(0) { $0 + Int($1.mNumberChannels) }
-
-        // Output frame count from the first output buffer.
         guard let firstOut = outBuffers.first, firstOut.mNumberChannels > 0 else { return }
         let outFrames = Int(firstOut.mDataByteSize) / (MemoryLayout<Float>.size * Int(firstOut.mNumberChannels))
 
-        // Gather input into planar stereo scratch.
         var inFrames = 0
         var channelIndex = 0
         scratchL.withUnsafeMutableBufferPointer { lp in
             scratchR.withUnsafeMutableBufferPointer { rp in
+                // Gather input into planar stereo scratch.
                 for buf in inBuffers {
                     guard let data = buf.mData?.assumingMemoryBound(to: Float.self) else { continue }
                     let nch = Int(buf.mNumberChannels)
@@ -186,27 +221,27 @@ final class AudioTapEngine {
                 }
 
                 let frames = min(inFrames, outFrames, lp.count)
-                dbgInFrames = inFrames
-                var pk: Float = 0
-                for f in 0..<min(inFrames, lp.count) { pk = max(pk, abs(lp[f]), abs(rp[f])) }
-                dbgRawPeak = max(pk, dbgRawPeak * 0.5)
-                if channelIndex == 1 { // mono tap: duplicate
-                    for f in 0..<frames { rp[f] = lp[f] }
-                }
+                if channelIndex == 1 { for f in 0..<frames { rp[f] = lp[f] } } // mono tap: duplicate
+
                 var inSum = 0.0
-                for f in 0..<frames { inSum += Double(0.5 * (lp[f] + rp[f]) * 0.5 * (lp[f] + rp[f])) }
+                var rawPeak: Float = 0
+                for f in 0..<frames {
+                    let m = 0.5 * (lp[f] + rp[f])
+                    inSum += Double(m * m)
+                    rawPeak = max(rawPeak, abs(lp[f]), abs(rp[f]))
+                }
+                if rawPeak > 0 { heardAudio = true }
+
                 if frames > 0 {
                     leveler.process(left: lp.baseAddress!, right: rp.baseAddress!, frames: frames)
                 }
 
                 var outSum = 0.0
-                var opk: Float = 0
                 for f in 0..<frames {
-                    let m = 0.5 * (lp[f] + rp[f]); outSum += Double(m * m)
-                    opk = max(opk, abs(lp[f]), abs(rp[f]))
+                    let m = 0.5 * (lp[f] + rp[f])
+                    outSum += Double(m * m)
                 }
-                dbgInMs += inSum; dbgOutMs += outSum; dbgN += Double(frames)
-                dbgOutPeak = max(dbgOutPeak, opk)
+                accIn += inSum; accOut += outSum; accN += Double(frames)
 
                 // Scatter to output buffers: channel 0 -> L, 1 -> R, others silent.
                 var outChannel = 0
@@ -249,37 +284,17 @@ final class AudioTapEngine {
     private func scheduleRestart() {
         restartWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            print("Default output device changed; restarting…")
+            guard let self, self.isRunning else { return }
             self.tearDownPipeline()
-            do { try self.buildPipeline() } catch {
-                FileHandle.standardError.write(Data("Restart failed: \(error)\n".utf8))
+            do {
+                try self.buildPipeline()
+                self.onOutputDeviceChanged?(self.outputDeviceName)
+            } catch {
+                self.onError?(error)
             }
         }
         restartWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
-    }
-
-    // MARK: - Verbose status
-
-    private func startStatusTimer() {
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + 1, repeating: 1)
-        timer.setEventHandler { [weak self] in
-            guard let lv = self?.leveler else { return }
-            guard let self else { return }
-            let n = max(self.dbgN, 1)
-            let inDb = 10 * log10(max(self.dbgInMs / n, 1e-12))
-            let outDb = 10 * log10(max(self.dbgOutMs / n, 1e-12))
-            print(String(format: "METER in %6.1f dB  out %6.1f dB  out-peak %5.1f dBFS", inDb, outDb,
-                         20 * log10(Double(max(self.dbgOutPeak, 1e-9)))))
-            self.dbgInMs = 0; self.dbgOutMs = 0; self.dbgN = 0; self.dbgOutPeak = 0
-            print(String(format: "level %6.1f dB   gain %+5.1f dB   | callbacks %d, in buffers %d, in channels %d, frames %d, raw peak %.5f",
-                         lv.currentLevelDb, lv.currentGainDb, self.cbCount, self.dbgInBuffers,
-                         self.dbgInChannels, self.dbgInFrames, self.dbgRawPeak))
-        }
-        timer.resume()
-        statusTimer = timer
     }
 
     // MARK: - Core Audio helpers

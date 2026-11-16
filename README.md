@@ -9,6 +9,20 @@ music/effects are pulled down, for every app at once.
 - The result is played on your current default output device. Switching output devices is handled automatically.
 - Ctrl-C (or killing the process) destroys the tap and your normal audio returns.
 
+## The app (recommended)
+`Auto Volume` lives in your menu bar: a live graph of original vs leveled sound, how many dB it is
+boosting or calming, four modes (Gentle / Balanced / Strong / Night), on/off switch and "Open at login".
+Left-click the menu bar icon for the panel, right-click for a quick menu.
+
+```sh
+scripts/make-dmg.sh     # builds dist/AutoVolume-<version>.dmg (drag the app to Applications)
+scripts/build-app.sh    # builds just dist/Auto Volume.app
+```
+First launch asks for permission to capture system audio — click Allow. The app is ad-hoc signed
+(not notarized), so on *another* Mac use right-click → Open the first time.
+For a prettier DMG window, allow Terminal to control Finder when macOS asks while running `make-dmg.sh`.
+
+## Command line tool
 ## Build & run
 ```sh
 swift build -c release

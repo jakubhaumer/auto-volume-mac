@@ -14,6 +14,10 @@ let package = Package(
             dependencies: ["AutoVolumeCore"]
         ),
         .executableTarget(
+            name: "AutoVolume",
+            dependencies: ["AutoVolumeCore"]
+        ),
+        .executableTarget(
             name: "leveler-check",
             dependencies: ["AutoVolumeCore"]
         ),

@@ -51,10 +51,13 @@ while let arg = args.next() {
 guard config.targetDb < -3, config.targetDb > -50 else { fail("--target must be between -50 and -3") }
 guard config.maxBoostDb >= 0, config.maxCutDb >= 0 else { fail("--max-boost/--max-cut must be >= 0") }
 
-let engine = AudioTapEngine(config: config, verbose: verbose)
+let engine = AudioTapEngine(config: config)
+engine.onOutputDeviceChanged = { print("Output device changed -> \($0)") }
+engine.onError = { FileHandle.standardError.write(Data("Restart failed: \($0)\n".utf8)) }
 
 do {
     try engine.start()
+    print("Leveling system audio -> \(engine.outputDeviceName)" + (config.bypass ? " [BYPASS]" : ""))
 } catch {
     FileHandle.standardError.write(Data("""
     Could not start: \(error)
@@ -64,6 +67,18 @@ do {
 
     """.utf8))
     exit(1)
+}
+
+var statusTimer: DispatchSourceTimer?
+if verbose {
+    let t = DispatchSource.makeTimerSource(queue: .main)
+    t.schedule(deadline: .now() + 1, repeating: 1)
+    t.setEventHandler {
+        let m = engine.readMetrics()
+        print(String(format: "in %6.1f dB   out %6.1f dB   gain %+5.1f dB", m.inputDb, m.outputDb, m.gainDb))
+    }
+    t.resume()
+    statusTimer = t
 }
 
 // Clean shutdown: destroying the tap restores the original audio path.
