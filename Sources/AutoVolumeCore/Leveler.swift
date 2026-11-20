@@ -1,202 +1,312 @@
 import Foundation
 
-/// Tunable parameters for the leveler. All levels are in dBFS / dB.
+/// Tunable parameters. Levels are K-weighted loudness in LUFS (ITU-R BS.1770), gains in dB.
+///
+/// The defaults and the structure are documented, with sources, in docs/RESEARCH.md.
 public struct LevelerConfig {
-    /// Loudness (RMS, dBFS) the leveler steers the signal toward.
-    public var targetDb: Float = -23
-    /// Maximum amount of gain added to quiet passages.
-    public var maxBoostDb: Float = 18
-    /// Maximum amount of gain removed from loud passages.
-    public var maxCutDb: Float = 20
-    /// Below this short-term level the signal is treated as silence and gain is held (not boosted).
-    public var gateDb: Float = -55
-    /// Compressor ratio applied to peaks above `targetDb + compressorHeadroomDb`.
-    public var ratio: Float = 3
-    /// How far above the target the fast compressor starts to act.
-    public var compressorHeadroomDb: Float = 16
-    /// Limiter ceiling.
-    public var ceilingDb: Float = -1
-    /// Half-width of the "natural dynamics" zone: while the loudness is within this many dB of
-    /// the target the gain only drifts slowly, so normal speech emphasis passes through untouched.
-    /// A larger deviation is treated as a scene change and corrected quickly until within ~2.5 dB.
-    public var bandDb: Float = 9
-    /// When true the signal passes through untouched (still delayed by the lookahead).
+    /// Loudness the leveler steers toward.
+    public var targetLufs: Double = -19
+    /// Half-width of the transparent zone: programme loudness within ±nullBandDb of the target is
+    /// left untouched (EBU R 128 s4 / Tech 3343: leave the mix alone while loudness-to-dialogue
+    /// differences are small).
+    public var nullBandDb: Double = 1
+    /// Slope outside the transparent zone, as an input:output ratio (1 = off, large = full leveling).
+    public var boostRatio: Double = 30
+    public var cutRatio: Double = 30
+    /// Gain limits of the slow loop.
+    public var maxBoostDb: Double = 18
+    public var maxCutDb: Double = 20
+    /// Fast guard: the gain may never exceed what the static curve would give for a signal that is this
+    /// many dB quieter than the current short-term loudness. It retracts boost the instant a loud event
+    /// starts, yet stays inactive for ordinary speech crest and emphasis.
+    public var guardSlackDb: Double = 16
+    /// True-peak ceiling of the output limiter, dBTP.
+    public var ceilingDb: Double = -2
+    /// Below this level the signal counts as silence/room tone; gain is frozen so it is never boosted
+    /// (the broadcast "silence gate": Orban 464A manual - prevents noise rush-up, pumping, breathing).
+    public var gateLufs: Double = -50
+    /// Momentary guard: when output loudness (150 ms window) would exceed target + this margin, the excess
+    /// is cut quickly (ratio = cutRatio). Catches sustained loud events without touching speech emphasis.
+    public var momentaryMarginDb: Double = 10
+    /// Time constant of the program-loudness estimate (BS.1770 Momentary = 0.4 s, Short-term = 3 s).
+    public var levelWindowS: Double = 2.0
+    /// Error-dependent gain speed: tau = tau0 / (1 + (|error| / adaptBandDb)^2). Small errors are corrected
+    /// slowly (speech emphasis and normal dynamics survive), large ones quickly (scene changes).
+    public var adaptBandDb: Double = 8
+    public var riseTau0S: Double = 4
+    public var fallTau0S: Double = 2.5
+    /// Pass-through (same delay, no processing) for A/B comparison.
     public var bypass: Bool = false
 
     public init() {}
 }
 
-/// Stereo, allocation-free loudness leveler: slow AGC -> fast compressor -> lookahead limiter.
+/// Stereo loudness leveler with a slow loop (program level), a fast protector (sudden loud events)
+/// and a true-peak lookahead limiter.
 ///
-/// Call `process` from a single (audio) thread. The read-only properties `currentGainDb`
-/// and `currentLevelDb` are safe to poll from another thread for display purposes.
+/// Call `process` from one audio thread only. `currentGainDb`, `currentLevelLufs` and
+/// `protectorGainDb` are for display and may be polled from another thread.
 public final class Leveler {
     public var config: LevelerConfig
     public private(set) var currentGainDb: Float = 0
-    public private(set) var currentLevelDb: Float = -120
+    public private(set) var currentLevelLufs: Float = -120
+    public private(set) var protectorGainDb: Float = 0
 
-    private let sampleRate: Float
+    private let sr: Double
 
-    // Detector (slow RMS of a high-passed mono mix).
-    private var hpState: Float = 0
-    private var hpPrevIn: Float = 0
-    private let hpCoef: Float
-    private var meanSquare: Float = 0
-    private let msCoef: Float
-    // Presence detection: a fast detector tells "someone is speaking" from "a pause".
-    private var fastSquare: Float = 0
-    private let fastCoef: Float
-    private var quietSamples = 0
-    private let holdSamples: Int
+    // MARK: Fixed design constants (see docs/RESEARCH.md for the evidence behind each)
+    private let block = 64                          // control-rate block (~1.3 ms)
+    private let presenceMarginDb = 15.9             // ITU-T P.56 active-speech threshold margin
+    private let presenceHangoverS = 0.2             // ITU-T P.56 hangover
+    private let holdS = 2.0                         // pauses shorter than this never move the gain
+    private let maxRiseDbPerS = 6.0                 // WebRTC AGC2 default gain-change limit
+    private let maxFallDbPerS = 15.0
+    private let protectorRecoveryS = 0.1            // Moore/Glasberg/Stone fast-component recovery 80-150 ms
+    private let limiterReleaseS = 0.15
+    private let limiterLookaheadS = 0.010
+    private let gainLookaheadS = 0.005
 
-    // AGC gain (linear-in-dB state, smoothed).
-    private var agcGainDb: Float = 0
-    private let agcAttackCoef: Float      // fast, used for the part of the error outside the band
-    private let agcReleaseCoef: Float
-    private let agcSlowCoef: Float        // slow drift used while inside the band
-    private var sceneChange = false       // true while correcting a big loudness jump quickly
+    // MARK: Detection state (K-weighted, on the undelayed signal)
+    private var kwL: KWeighting, kwR: KWeighting
+    private var envP = 0.0          // 30 ms presence envelope (P.56)
+    private var fastP = 0.0         // fast loudness (boost guard)
+    private var momP = 0.0          // momentary loudness (output-referred cut guard)
+    private let aMom: Double
+    private var slowP = 0.0         // active-program loudness
+    private let aEnv: Double, aFastRise: Double, aFastFall: Double
+    private var aSlow: Double, aSlowAcquire: Double
+    private var sRise: Double, sFall: Double
 
-    // Compressor envelope follower on the post-AGC peak.
-    private var compEnv: Float = 0
-    private let compAttackCoef: Float
-    private let compReleaseCoef: Float
-    private let kneeDb: Float = 6
+    private var tracking = false
+    private var acquiring = true
+    private var acquireTime = 0.0
+    private var quietTime = 0.0
+    private var slowValid = false
 
-    // Limiter.
+    // MARK: Gain state
+    private var gSlow = 0.0         // dB
+    private var gFast = 0.0         // dB (<= 0)
+    private var gCur = 1.0, gStep = 0.0
+    private var blockPos = 0
+
+    // MARK: Gain-anticipation delay
+    private var gdL: [Float], gdR: [Float]
+    private var gdPos = 0
+
+    // MARK: Limiter
     private let lookahead: Int
-    private var delayL: [Float]
-    private var delayR: [Float]
-    private var peakRing: [Float]
-    private var ringPos = 0
-    private var limiterGain: Float = 1
-    private let limiterAttackCoef: Float
-    private let limiterReleaseCoef: Float
+    private var limL: [Float], limR: [Float]
+    private var limPos = 0
+    private var truePeak: TruePeak
+    private var dqVal: [Float], dqIdx: [Int]
+    private var dqHead = 0, dqCount = 0
+    private var sampleIndex = 0
+    private var msRing: [Float]
+    private var msSum: Double
+    private var msPos = 0
+    private var limGain = 1.0
+    private let relCoef: Double
 
     public init(sampleRate: Double, config: LevelerConfig = LevelerConfig()) {
-        let sr = Float(sampleRate)
-        self.sampleRate = sr
+        sr = sampleRate
         self.config = config
+        kwL = KWeighting(sampleRate: sampleRate)
+        kwR = KWeighting(sampleRate: sampleRate)
 
-        func coef(_ seconds: Float) -> Float { exp(-1 / (seconds * sr)) }
+        func a(_ seconds: Double) -> Double { 1 - exp(-1 / (seconds * sampleRate)) }
+        aEnv = a(0.030)                  // P.56 envelope time constant
+        aMom = a(0.150)
+        aFastRise = a(0.010)
+        aFastFall = a(0.100)
+        aSlow = a(config.levelWindowS)  // symmetric: between BS.1770 Momentary (0.4 s) and Short-term (3 s)
+        aSlowAcquire = a(0.3)
+        sRise = aSlow; sFall = aSlow
 
-        hpCoef = exp(-2 * .pi * 80 / sr)   // ~80 Hz one-pole high-pass
-        msCoef = coef(0.6)                 // 600 ms RMS window
-        fastCoef = coef(0.04)              // 40 ms presence detector
-        holdSamples = Int(2.5 * sr)        // pauses shorter than this never change the gain
-        agcAttackCoef = coef(0.2)          // big loud jump: reduce fast
-        agcReleaseCoef = coef(0.75)        // gain increase: moderately slow
-        agcSlowCoef = coef(4.0)
-        compAttackCoef = coef(0.008)
-        compReleaseCoef = coef(0.25)
+        let gd = max(1, Int(gainLookaheadS * sampleRate))
+        gdL = [Float](repeating: 0, count: gd)
+        gdR = [Float](repeating: 0, count: gd)
 
-        lookahead = max(1, Int(0.005 * sr)) // 5 ms
-        delayL = [Float](repeating: 0, count: lookahead)
-        delayR = [Float](repeating: 0, count: lookahead)
-        peakRing = [Float](repeating: 0, count: lookahead)
-        limiterAttackCoef = exp(-1 / (Float(lookahead) / 3))
-        limiterReleaseCoef = coef(0.08)
+        lookahead = max(2, Int(limiterLookaheadS * sampleRate))
+        limL = [Float](repeating: 0, count: lookahead)
+        limR = [Float](repeating: 0, count: lookahead)
+        truePeak = TruePeak(sampleRate: sampleRate)
+        dqVal = [Float](repeating: 1, count: lookahead + 2)
+        dqIdx = [Int](repeating: 0, count: lookahead + 2)
+        msRing = [Float](repeating: 1, count: lookahead)
+        msSum = Double(lookahead)
+        relCoef = exp(-1 / (limiterReleaseS * sampleRate))
     }
 
-    /// Latency introduced by the limiter lookahead, in frames.
-    public var latencyFrames: Int { lookahead }
+    /// Total added delay in frames.
+    public var latencyFrames: Int { gdL.count + lookahead }
 
-    @inline(__always) private func db(_ x: Float) -> Float { 20 * log10f(max(x, 1e-9)) }
-    @inline(__always) private func lin(_ db: Float) -> Float { powf(10, db / 20) }
+    @inline(__always) private func lin(_ db: Double) -> Double { pow(10, db / 20) }
+
+    /// Static gain curve: unity inside the transparent zone, ratio-controlled boost below / cut above.
+    /// With `softFloor`, the allowed boost fades from 0 at the silence gate to full 10 dB above it, so a noise
+    /// floor near the gate is never boosted hard (no hiss rush-up).
+    @inline(__always) private func curve(_ levelLufs: Double, _ cfg: LevelerConfig, softFloor: Bool) -> Double {
+        let d = levelLufs - cfg.targetLufs
+        var g = 0.0
+        if d > cfg.nullBandDb { g = -(d - cfg.nullBandDb) * (1 - 1 / max(cfg.cutRatio, 1)) }
+        else if d < -cfg.nullBandDb { g = (-d - cfg.nullBandDb) * (1 - 1 / max(cfg.boostRatio, 1)) }
+        var maxBoost = cfg.maxBoostDb
+        if softFloor {
+            let f = min(1, max(0, (levelLufs - cfg.gateLufs) / 10))
+            maxBoost *= f * f * (3 - 2 * f)          // smoothstep
+        }
+        return min(maxBoost, max(-cfg.maxCutDb, g))
+    }
 
     /// Processes `frames` samples of planar stereo audio in place.
     public func process(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>, frames: Int) {
         let cfg = config
-        let targetDb = cfg.targetDb
-        let compThreshold = targetDb + cfg.compressorHeadroomDb
-        let slope = 1 - 1 / max(cfg.ratio, 1)
         let ceiling = lin(cfg.ceilingDb)
+        let bypass = cfg.bypass
+        let gdLen = gdL.count
 
         for n in 0..<frames {
-            let inL = left[n]
-            let inR = right[n]
+            let xl = Double(left[n]), xr = Double(right[n])
 
-            var l = inL
-            var r = inR
+            // ---- Detection on the undelayed signal.
+            let kl = kwL.process(xl), kr = kwR.process(xr)
+            let p = kl * kl + kr * kr
+            envP += (p - envP) * aEnv
+            fastP += (p - fastP) * (p > fastP ? aFastRise : aFastFall)
+            momP += (p - momP) * aMom
+            if tracking { slowP += (p - slowP) * (p > slowP ? sRise : sFall) }
 
-            if !cfg.bypass {
-                // --- Detector: high-passed mono mix -> slow mean square.
-                let mono = 0.5 * (inL + inR)
-                let hp = hpCoef * (hpState + mono - hpPrevIn)
-                hpState = hp
-                hpPrevIn = mono
-                fastSquare = fastCoef * fastSquare + (1 - fastCoef) * (hp * hp)
-                let fastDb = 10 * log10f(max(fastSquare, 1e-12))
-                let slowDb = 10 * log10f(max(meanSquare, 1e-12))
-
-                // Presence: signal must be above the gate and not far below what we have been tracking.
-                // During a pause (or room tone between phrases) everything is frozen, so the gain
-                // cannot creep up and make the next phrase start too loud. After a long quiet spell
-                // (a genuine scene change) tracking resumes.
-                let present = fastDb > max(cfg.gateDb, slowDb - 15)
-                quietSamples = present ? 0 : min(quietSamples + 1, holdSamples + 1)
-                let tracking = present || quietSamples > holdSamples
-
-                var levelDb = slowDb
-                if tracking {
-                    meanSquare = msCoef * meanSquare + (1 - msCoef) * (hp * hp)
-                    levelDb = 10 * log10f(max(meanSquare, 1e-12))
-                }
-                currentLevelDb = levelDb
-
-                // --- AGC: steer toward target; hold when paused or below the gate.
-                if tracking && levelDb > cfg.gateDb {
-                    let desired = min(cfg.maxBoostDb, max(-cfg.maxCutDb, targetDb - levelDb))
-                    let err = desired - agcGainDb
-                    // Small deviations drift slowly (keeps speech emphasis); a big jump switches to
-                    // fast correction until we are close to the target again.
-                    if !sceneChange && abs(err) > cfg.bandDb { sceneChange = true }
-                    else if sceneChange && abs(err) < 2.5 { sceneChange = false }
-                    let c = sceneChange ? (err < 0 ? agcAttackCoef : agcReleaseCoef) : agcSlowCoef
-                    agcGainDb += (1 - c) * err
-                }
-                currentGainDb = agcGainDb
-                let agcGain = lin(agcGainDb)
-                l *= agcGain
-                r *= agcGain
-
-                // --- Fast compressor on post-AGC peak (soft knee).
-                let peak = max(abs(l), abs(r))
-                let ec = peak > compEnv ? compAttackCoef : compReleaseCoef
-                compEnv = ec * compEnv + (1 - ec) * peak
-                let envDb = db(compEnv)
-                let over = envDb - compThreshold
-                var reductionDb: Float = 0
-                if over > kneeDb / 2 {
-                    reductionDb = over * slope
-                } else if over > -kneeDb / 2 {
-                    let x = over + kneeDb / 2
-                    reductionDb = slope * x * x / (2 * kneeDb)
-                }
-                if reductionDb > 0 {
-                    let g = lin(-reductionDb)
-                    l *= g
-                    r *= g
-                }
+            blockPos += 1
+            if blockPos == block {
+                blockPos = 0
+                control(cfg)
             }
 
-            // --- Lookahead limiter: delay audio, track peak over the window.
-            let slot = ringPos
-            let delayedL = delayL[slot]
-            let delayedR = delayR[slot]
-            delayL[slot] = l
-            delayR[slot] = r
-            peakRing[slot] = max(abs(l), abs(r))
-            ringPos = slot + 1 == lookahead ? 0 : slot + 1
+            // ---- Gain stage on a short-delayed copy, so the gain can anticipate onsets.
+            let dl = gdL[gdPos], dr = gdR[gdPos]
+            gdL[gdPos] = Float(xl); gdR[gdPos] = Float(xr)
+            gdPos += 1; if gdPos == gdLen { gdPos = 0 }
 
-            var windowPeak: Float = 0
-            for p in peakRing where p > windowPeak { windowPeak = p }
-            let needed: Float = windowPeak > ceiling ? ceiling / windowPeak : 1
-            let lc = needed < limiterGain ? limiterAttackCoef : limiterReleaseCoef
-            limiterGain = lc * limiterGain + (1 - lc) * needed
+            var yl = Double(dl), yr = Double(dr)
+            if !bypass {
+                gCur += gStep
+                yl *= gCur; yr *= gCur
+            }
 
-            // Hard safety clamp (final guard against any residual overshoot).
-            left[n] = min(0.999, max(-0.999, delayedL * limiterGain))
-            right[n] = min(0.999, max(-0.999, delayedR * limiterGain))
+            // ---- True-peak lookahead limiter.
+            let tp = bypass ? 0 : truePeak.peak(yl, yr)
+            let req = Float(tp > ceiling ? ceiling / tp : 1)
+
+            // sliding-window minimum of the requirement over the last (lookahead + 1) samples
+            let cap = dqVal.count
+            while dqCount > 0 {
+                let back = (dqHead + dqCount - 1) % cap
+                if dqVal[back] >= req { dqCount -= 1 } else { break }
+            }
+            dqVal[(dqHead + dqCount) % cap] = req
+            dqIdx[(dqHead + dqCount) % cap] = sampleIndex
+            dqCount += 1
+            while dqIdx[dqHead] < sampleIndex - lookahead {
+                dqHead = (dqHead + 1) % cap
+                dqCount -= 1
+            }
+            let minReq = dqVal[dqHead]
+            sampleIndex += 1
+
+            // moving average of the minimum => linear attack ramp that reaches the target at the peak
+            msSum += Double(minReq - msRing[msPos])
+            msRing[msPos] = minReq
+            msPos += 1; if msPos == lookahead { msPos = 0 }
+            let smoothed = msSum / Double(lookahead)
+
+            // slow release, instant (pre-ramped) attack
+            let released = 1 - (1 - limGain) * relCoef
+            limGain = min(smoothed, released)
+
+            let ol = Double(limL[limPos]), or = Double(limR[limPos])
+            limL[limPos] = Float(yl); limR[limPos] = Float(yr)
+            limPos += 1; if limPos == lookahead { limPos = 0 }
+
+            let g = bypass ? 1.0 : limGain
+            left[n] = Float(max(-0.9995, min(0.9995, ol * g)))
+            right[n] = Float(max(-0.9995, min(0.9995, or * g)))
         }
+    }
+
+    // MARK: - Control (once per block)
+
+    private func control(_ cfg: LevelerConfig) {
+        let dt = Double(block) / sr
+        let eDb = Loudness.lufs(power: envP)
+        let fDb = Loudness.lufs(power: fastP)
+        var sDb = Loudness.lufs(power: slowP)
+
+        // --- Presence (ITU-T P.56 style): signal counts as "present" while the 30 ms envelope is within
+        // 15.9 dB of the tracked active level and above the silence gate. While absent, gain is frozen.
+        let aboveGate = eDb > cfg.gateLufs
+        if !slowValid && aboveGate {
+            slowP = envP; sDb = eDb; slowValid = true; acquiring = true; acquireTime = 0
+        }
+        let present = aboveGate && (!slowValid || eDb > sDb - presenceMarginDb)
+        quietTime = present ? 0 : quietTime + dt
+        let hangover = quietTime < presenceHangoverS
+        let longPause = quietTime > holdS            // treat as a new scene and re-acquire
+        let wasTracking = tracking
+        tracking = aboveGate && (present || hangover || longPause)
+        if tracking && !wasTracking && longPause { acquiring = true; acquireTime = 0 }
+
+        // Fast acquisition after start-up / scene change: use the momentary-style time constant until close.
+        if acquiring && tracking {
+            sRise = aSlowAcquire; sFall = aSlowAcquire
+            acquireTime += dt
+            if abs(sDb - eDb) < 3 || acquireTime > 1.5 { acquiring = false }
+        } else if !acquiring {
+            aSlow = 1 - exp(-1 / (max(cfg.levelWindowS, 0.05) * sr))
+            sRise = aSlow; sFall = aSlow
+        }
+
+        currentLevelLufs = Float(sDb)
+
+        if cfg.bypass {
+            gStep = (1 - gCur) / Double(block)
+            currentGainDb = 0; protectorGainDb = 0
+            return
+        }
+
+        // --- Slow loop: static gain curve with a transparent zone, slew-limited.
+        if slowValid {
+            let gt = curve(sDb, cfg, softFloor: true)
+            let delta = gt - gSlow
+            let ratio = delta / max(cfg.adaptBandDb, 0.1)
+            let speedUp = 1 + ratio * ratio
+            if delta < 0 {
+                let tau = cfg.fallTau0S / speedUp
+                let step = max(delta * (1 - exp(-dt / tau)), -maxFallDbPerS * dt)
+                gSlow += step
+            } else if delta > 0 && tracking {
+                let tau = cfg.riseTau0S / speedUp
+                let step = min(delta * (1 - exp(-dt / tau)), maxRiseDbPerS * dt)
+                gSlow += step
+            }
+        }
+
+        // --- Fast guard (dual front-end AGC, fast component): total gain may not exceed the curve value for
+        // (short-term loudness - slack). Instant attack, ~100 ms recovery.
+        let limit = fDb > cfg.gateLufs ? curve(fDb - cfg.guardSlackDb, cfg, softFloor: false) : cfg.maxBoostDb
+        let boostGuard = min(0, limit - gSlow)
+        let mDb = Loudness.lufs(power: momP)
+        let momExcess = mDb > cfg.gateLufs ? (mDb + gSlow) - (cfg.targetLufs + cfg.momentaryMarginDb) : 0
+        let momGuard = -max(0, momExcess) * (1 - 1 / max(cfg.cutRatio, 1))
+        let gfTarget = min(boostGuard, momGuard)
+        if gfTarget < gFast {
+            gFast = gfTarget
+        } else {
+            gFast += (gfTarget - gFast) * (1 - exp(-dt / protectorRecoveryS))
+        }
+
+        let total = gSlow + gFast
+        gStep = (lin(total) - gCur) / Double(block)
+        currentGainDb = Float(total)
+        protectorGainDb = Float(gFast)
     }
 }

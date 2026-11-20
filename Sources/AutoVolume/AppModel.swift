@@ -35,19 +35,23 @@ enum LevelMode: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Parameters come from the sweeps documented in docs/RESEARCH.md (emphasis kept, gain-step size, settling).
     var config: LevelerConfig {
         var c = LevelerConfig()
         switch self {
         case .gentle:
-            c.bandDb = 11; c.maxBoostDb = 12; c.maxCutDb = 14; c.ratio = 2.5; c.compressorHeadroomDb = 18
+            c.nullBandDb = 4; c.boostRatio = 4; c.cutRatio = 4; c.levelWindowS = 3
+            c.fallTau0S = 3.5; c.riseTau0S = 5; c.momentaryMarginDb = 12; c.guardSlackDb = 18
+            c.maxBoostDb = 12; c.maxCutDb = 14
         case .balanced:
             break
         case .strong:
-            c.targetDb = -21; c.bandDb = 6; c.maxBoostDb = 24; c.maxCutDb = 24; c.ratio = 3.5
-            c.compressorHeadroomDb = 12
+            c.targetLufs = -18; c.nullBandDb = 0.5; c.boostRatio = 50; c.cutRatio = 50; c.levelWindowS = 1.6
+            c.fallTau0S = 2; c.riseTau0S = 3.5; c.adaptBandDb = 7; c.maxBoostDb = 24; c.maxCutDb = 24
         case .night:
-            c.targetDb = -28; c.bandDb = 7; c.maxBoostDb = 18; c.maxCutDb = 28; c.ratio = 4
-            c.compressorHeadroomDb = 8; c.ceilingDb = -3
+            c.targetLufs = -24; c.nullBandDb = 0.5; c.boostRatio = 6; c.cutRatio = 50; c.levelWindowS = 1.8
+            c.fallTau0S = 2; c.riseTau0S = 5; c.adaptBandDb = 7; c.momentaryMarginDb = 9
+            c.maxBoostDb = 12; c.maxCutDb = 28
         }
         return c
     }

@@ -7,10 +7,11 @@ auto-volume — keep system audio at a steady loudness (macOS 14.2+)
 USAGE: auto-volume [options]
 
 OPTIONS:
-  --target <dB>      Target loudness in dBFS RMS            (default -23)
+  --target <LUFS>    Target loudness (K-weighted, BS.1770)  (default -19)
   --max-boost <dB>   Max gain added to quiet parts          (default 18)
   --max-cut <dB>     Max gain removed from loud parts       (default 20)
-  --ratio <n>        Fast compressor ratio for sudden peaks (default 3)
+  --zone <dB>        Untouched zone around the target       (default 1)
+  --ratio <n>        Leveling strength outside the zone     (default 30, 1 = off)
   --bypass           Pass audio through unprocessed (A/B test)
   --verbose          Print live level/gain once per second
   -h, --help         Show this help
@@ -34,10 +35,11 @@ func floatArg(_ name: String) -> Float {
 
 while let arg = args.next() {
     switch arg {
-    case "--target": config.targetDb = floatArg(arg)
-    case "--max-boost": config.maxBoostDb = floatArg(arg)
-    case "--max-cut": config.maxCutDb = floatArg(arg)
-    case "--ratio": config.ratio = floatArg(arg)
+    case "--target": config.targetLufs = Double(floatArg(arg))
+    case "--max-boost": config.maxBoostDb = Double(floatArg(arg))
+    case "--max-cut": config.maxCutDb = Double(floatArg(arg))
+    case "--zone": config.nullBandDb = Double(floatArg(arg))
+    case "--ratio": let r = Double(floatArg(arg)); config.boostRatio = r; config.cutRatio = r
     case "--bypass": config.bypass = true
     case "--verbose", "-v": verbose = true
     case "-h", "--help":
@@ -48,7 +50,7 @@ while let arg = args.next() {
     }
 }
 
-guard config.targetDb < -3, config.targetDb > -50 else { fail("--target must be between -50 and -3") }
+guard config.targetLufs < -5, config.targetLufs > -45 else { fail("--target must be between -45 and -5 LUFS") }
 guard config.maxBoostDb >= 0, config.maxCutDb >= 0 else { fail("--max-boost/--max-cut must be >= 0") }
 
 let engine = AudioTapEngine(config: config)
@@ -75,7 +77,9 @@ if verbose {
     t.schedule(deadline: .now() + 1, repeating: 1)
     t.setEventHandler {
         let m = engine.readMetrics()
-        print(String(format: "in %6.1f dB   out %6.1f dB   gain %+5.1f dB", m.inputDb, m.outputDb, m.gainDb))
+        print(String(format: "in %6.1f dB   out %6.1f dB   gain %+5.1f dB | buf %d fr, est. latency %.1f ms, max cb gap %.1f ms, empty-in %d, mismatch %d",
+                     m.inputDb, m.outputDb, m.gainDb, m.bufferFrames, m.estimatedLatencyMs, m.maxCallbackGapMs,
+                     m.emptyInputCallbacks, m.frameMismatchCallbacks))
     }
     t.resume()
     statusTimer = t

@@ -31,7 +31,7 @@ DEV="$(echo "$MOUNT_INFO" | grep -E '^/dev/' | head -1 | awk '{print $1}')"
 
 echo "▸ Styling the installer window (Finder)…"
 # Bounded run: if Finder automation isn't permitted, we still ship a working (plainer) DMG.
-perl -e 'alarm 60; exec @ARGV' osascript <<APPLESCRIPT || echo "  (window styling skipped — DMG still works)"
+perl -e 'alarm 20; exec @ARGV' osascript <<APPLESCRIPT || echo "  (window styling skipped — DMG still works)"
 tell application "Finder"
     tell disk "$VOL"
         open

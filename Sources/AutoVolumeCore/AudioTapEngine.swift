@@ -39,6 +39,12 @@ public final class AudioTapEngine {
         /// True once any non-zero audio sample has been received since start.
         public var heardAudio = false
         public var callbacks = 0
+        /// Diagnostics since start: callbacks whose input was empty / mismatched, and the longest gap between callbacks.
+        public var emptyInputCallbacks = 0
+        public var frameMismatchCallbacks = 0
+        public var maxCallbackGapMs: Double = 0
+        public var bufferFrames = 0
+        public var estimatedLatencyMs: Double = 0
         public init() {}
     }
 
@@ -67,6 +73,12 @@ public final class AudioTapEngine {
     private var cbCount = 0
     private var heardAudio = false
     private var accIn = 0.0, accOut = 0.0, accN = 0.0
+    private var dbgEmpty = 0, dbgMismatch = 0
+    private var lastCallbackHost: UInt64 = 0
+    private var maxGapNs: Double = 0
+    private var bufFrames = 0
+    private var latencyMs: Double = 0
+    private var sampleRate: Double = 48_000
 
     public init(config: LevelerConfig = LevelerConfig()) {
         self.config = config
@@ -113,6 +125,11 @@ public final class AudioTapEngine {
         accIn = 0; accOut = 0; accN = 0
         m.heardAudio = heardAudio
         m.callbacks = cbCount
+        m.emptyInputCallbacks = dbgEmpty
+        m.frameMismatchCallbacks = dbgMismatch
+        m.maxCallbackGapMs = maxGapNs / 1e6
+        m.bufferFrames = bufFrames
+        m.estimatedLatencyMs = latencyMs
         return m
     }
 
@@ -125,6 +142,7 @@ public final class AudioTapEngine {
         cbCount = 0
         heardAudio = false
         accIn = 0; accOut = 0; accN = 0
+        dbgEmpty = 0; dbgMismatch = 0; maxGapNs = 0; lastCallbackHost = 0
 
         // 1. Global stereo tap that mutes the original audio (but never our own output).
         let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: Self.ownProcessObjects())
@@ -158,13 +176,20 @@ public final class AudioTapEngine {
 
             // 3. Sample rate of the aggregate drives the DSP coefficients.
             let rate = try Self.nominalSampleRate(aggregateID)
+            sampleRate = rate
+            bufFrames = Int(Self.uint32Property(aggregateID, kAudioDevicePropertyBufferFrameSize, scope: kAudioObjectPropertyScopeGlobal) ?? 0)
+            // Latency of the output path: device + stream latency + safety offset + one buffer (we render in-callback).
+            let outLat = Self.uint32Property(outputID, kAudioDevicePropertyLatency, scope: kAudioObjectPropertyScopeOutput) ?? 0
+            let outSafety = Self.uint32Property(outputID, kAudioDevicePropertySafetyOffset, scope: kAudioObjectPropertyScopeOutput) ?? 0
+            latencyMs = Double(Int(outLat) + Int(outSafety) + bufFrames) / rate * 1000
             leveler = Leveler(sampleRate: rate, config: config)
             scratchL = [Float](repeating: 0, count: 16_384)
             scratchR = [Float](repeating: 0, count: 16_384)
 
             // 4. IO proc.
             try check(AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, ioQueue) {
-                [unowned self] _, inData, _, outData, _ in
+                [unowned self] inNow, inData, _, outData, _ in
+                self.noteCallback(host: inNow.pointee.mHostTime)
                 self.render(input: inData, output: outData)
             }, "AudioDeviceCreateIOProcIDWithBlock")
             try check(AudioDeviceStart(aggregateID, ioProcID), "AudioDeviceStart")
@@ -192,6 +217,20 @@ public final class AudioTapEngine {
     }
 
     // MARK: - Real-time render (no allocations, no locks)
+
+    private static let hostToNs: Double = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return Double(info.numer) / Double(info.denom)
+    }()
+
+    private func noteCallback(host: UInt64) {
+        if lastCallbackHost != 0 {
+            let gap = Double(host - lastCallbackHost) * Self.hostToNs
+            if gap > maxGapNs { maxGapNs = gap }
+        }
+        lastCallbackHost = host
+    }
 
     private func render(input: UnsafePointer<AudioBufferList>, output: UnsafeMutablePointer<AudioBufferList>) {
         guard let leveler else { return }
@@ -221,6 +260,8 @@ public final class AudioTapEngine {
                 }
 
                 let frames = min(inFrames, outFrames, lp.count)
+                if inFrames == 0 { dbgEmpty &+= 1 }
+                if inFrames != outFrames { dbgMismatch &+= 1 }
                 if channelIndex == 1 { for f in 0..<frames { rp[f] = lp[f] } } // mono tap: duplicate
 
                 var inSum = 0.0
@@ -335,6 +376,14 @@ public final class AudioTapEngine {
         try check(AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value), "get string property")
         guard let s = value?.takeRetainedValue() else { throw EngineError.message("Empty string property") }
         return s as String
+    }
+
+    static func uint32Property(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector,
+                               scope: AudioObjectPropertyScope) -> UInt32? {
+        var v = UInt32(0)
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var addr = address(selector, scope: scope)
+        return AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &v) == noErr ? v : nil
     }
 
     static func nominalSampleRate(_ id: AudioObjectID) throws -> Double {
